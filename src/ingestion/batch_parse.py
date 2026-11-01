@@ -1,6 +1,8 @@
 import os
 import glob
-from docling.document_converter import DocumentConverter
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+from docling.document_converter import DocumentConverter, PdfFormatOption
 
 INPUT_DIR = "data/production_baseline"
 OUTPUT_DIR = "data/parsed_docs"
@@ -17,7 +19,17 @@ def batch_parse_documents():
         return
 
     print(f"Found {len(pdf_files)} documents. Booting up Docling...")
-    converter = DocumentConverter()
+
+    # Speed settings: 10-K PDFs already contain text, so OCR is not needed.
+    # FAST table mode still extracts tables, just with a lighter model.
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.do_ocr = False
+    pipeline_options.do_table_structure = True
+    pipeline_options.table_structure_options.mode = TableFormerMode.FAST
+
+    converter = DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
+    )
     
     for i, pdf_path in enumerate(pdf_files, 1):
         filename = os.path.basename(pdf_path)
