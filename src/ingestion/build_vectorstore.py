@@ -9,8 +9,13 @@ DB_DIR = "data/chroma_db"
 
 def build_vector_store():
     # 1. Initialize the local, free HuggingFace embedding model
-    print("Loading HuggingFace embedding model (all-MiniLM-L6-v2)...")
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    print("Loading HuggingFace embedding model (nomic-embed-text-v1.5)...")
+    embeddings = HuggingFaceEmbeddings(
+        model_name="nomic-ai/nomic-embed-text-v1.5",
+        model_kwargs={"trust_remote_code": True},
+        encode_kwargs={"prompt": "search_document: ", "normalize_embeddings": True},
+        query_encode_kwargs={"prompt": "search_query: ", "normalize_embeddings": True},
+    )
     
     # 2. Initialize ChromaDB
     print(f"Initializing ChromaDB at {DB_DIR}...")
@@ -42,10 +47,11 @@ def build_vector_store():
             continue
             
         # Attach metadata to every chunk so the AI can cite its sources later
-        metadatas = [{"source": source_doc} for _ in chunks]
+        metadatas = [{"source": source_doc, "chunk_id": i} for i in range(len(chunks))]
+        ids = [f"{source_doc}-{i}" for i in range(len(chunks))]
         
-        # Add to ChromaDB (this handles the embedding math automatically)
-        vectorstore.add_texts(texts=chunks, metadatas=metadatas)
+        # Add to ChromaDB (fixed ids -> re-running updates instead of duplicating)
+        vectorstore.add_texts(texts=chunks, metadatas=metadatas, ids=ids)
         print(f"    -> Embedded {len(chunks)} chunks into ChromaDB.")
 
     print(f"\n✅ Vector database built successfully at {DB_DIR}!")
