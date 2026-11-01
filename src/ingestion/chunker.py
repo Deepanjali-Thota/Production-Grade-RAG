@@ -1,4 +1,5 @@
 import os
+import re
 import glob
 import json
 import tiktoken
@@ -18,7 +19,7 @@ def chunk_markdown_files():
     # Set up the chunker to measure by tokens, using your exact specs
     text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
         encoding_name="cl100k_base", # Standard token encoding used by most modern LLMs
-        chunk_size=1000,             # Max tokens per chunk
+        chunk_size=990,              # Max tokens per chunk (small margin so real count stays <= 1000)
         chunk_overlap=100,           # 100 token overlap to prevent cutting context in half
         separators=[" "],            # word-level packing -> every chunk fills to ~1000 tokens (>= 800)
     )
@@ -36,6 +37,9 @@ def chunk_markdown_files():
         
         with open(md_path, "r", encoding="utf-8") as f:
             text = f.read()
+        
+        # Collapse table padding (runs of spaces/tabs) so token counts are accurate
+        text = re.sub(r"[ \t]+", " ", text)
             
         # Perform the actual chunking
         chunks = text_splitter.split_text(text)

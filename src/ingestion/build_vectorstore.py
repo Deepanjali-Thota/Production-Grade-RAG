@@ -9,12 +9,12 @@ DB_DIR = "data/chroma_db"
 
 def build_vector_store():
     # 1. Initialize the local, free HuggingFace embedding model
-    print("Loading HuggingFace embedding model (nomic-embed-text-v1.5)...")
+    print("Loading HuggingFace embedding model (modernbert-embed-base)...")
     embeddings = HuggingFaceEmbeddings(
-        model_name="nomic-ai/nomic-embed-text-v1.5",
-        model_kwargs={"trust_remote_code": True},
-        encode_kwargs={"prompt": "search_document: ", "normalize_embeddings": True},
+        model_name="nomic-ai/modernbert-embed-base",
+        encode_kwargs={"prompt": "search_document: ", "normalize_embeddings": True, "batch_size": 8},
         query_encode_kwargs={"prompt": "search_query: ", "normalize_embeddings": True},
+        show_progress=True,
     )
     
     # 2. Initialize ChromaDB
