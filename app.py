@@ -11,6 +11,12 @@ from langchain_core.output_parsers import StrOutputParser
 from src.retrieval.hybrid_search import build_reranked_retriever
 
 FINAL_K = 10
+MIN_RELEVANCE = 0.10   # chunks the reranker scores below this are not used as evidence
+REFUSAL_NO_EVIDENCE = "I can't answer this: none of the documents contain passages relevant to the question."
+REFUSAL_FAILED_CHECKS = "I can't give a reliable answer: most claims in the generated answer failed citation checks."
+NO_INFO = "No relevant information found in the provided excerpts"
+SECTION_EMPTY = "No supported information remained for this company after citation checks."
+MAX_REMOVED_FRACTION = 0.5   # refuse if more than half of the claims fail their citation checks
 
 # Company names extracted automatically from each document (src/ingestion/extract_companies.py)
 COMPANIES_FILE = "data/companies.json"
@@ -71,6 +77,19 @@ def detect_companies(question):
             found.append(key)
     return found
 
+def question_for_company(question, key):
+    """Rewrite the question so it names only ONE company (other names lower the reranker's scores)."""
+    q = question
+    for alias in COMPANY_ALIASES:   # mark every company mention, e.g. "Cisco", "FedEx's"
+        q = re.sub(rf"\b{re.escape(alias)}(?:'s|’s)?\b", "\x00", q, flags=re.IGNORECASE)
+    # "Cisco, FedEx and P&G" -> one marker, then remove it
+    q = re.sub(r"\x00(?:\s*(?:,|\band\b|\bor\b|&)\s*\x00)*", "\x00", q, flags=re.IGNORECASE)
+    q = re.sub(r"\s+", " ", q.replace("\x00", "")).strip()
+    # Drop connectors left dangling at the end, e.g. "...disruptions for and ?" -> "...disruptions"
+    q = re.sub(r"(?:\s*(?:,|\band\b|\bor\b|\bfor\b|\bof\b|\bat\b|\bbetween\b))+\s*[?.!]*$", "", q, flags=re.IGNORECASE)
+    q = q.rstrip(" ?.!")
+    return f"{q} for {COMPANY_INDEX[key]['name']}?"
+
 def retrieve(question):
     keys = detect_companies(question)
     if not keys:
@@ -81,9 +100,11 @@ def retrieve(question):
     docs = []
     for key in keys:
         entry = COMPANY_INDEX[key]
+        company_question = question_for_company(question, key)
         print(f"   -> searching only {entry['name']} ({len(entry['sources'])} document(s)), top {per_company}")
+        print(f"      query: {company_question}")
         retriever = build_reranked_retriever(final_k=per_company, sources=entry["sources"])
-        docs.extend(retriever.invoke(question))
+        docs.extend(retriever.invoke(company_question))
     return docs
 
 def company_of(source):
@@ -118,6 +139,79 @@ def extract_citations(answer):
             cited.add(int(n.strip()))
     return sorted(cited)
 
+def apply_evidence_gate(docs):
+    """Keep only chunks the reranker considers relevant enough to serve as evidence."""
+    return [d for d in docs if (d.metadata.get("relevance_score") or 0) >= MIN_RELEVANCE]
+
+def section_company(heading, docs):
+    """Which retrieved company (if any) a section heading like '**Cisco Systems, Inc.**' names."""
+    words = normalize_words(heading)
+    for doc in docs:
+        name = company_of(doc.metadata.get("source"))
+        key_words = normalize_words(name)
+        if key_words and key_words[0] in words:
+            return name
+    return None
+
+def is_heading(text, plain):
+    # "**Cisco Systems, Inc.**", "# FedEx", or an intro line ending in ":" -- structure, not a claim
+    return text.startswith("#") or (text.startswith("**") and text.endswith("**")) or plain.endswith(":")
+
+def claim_problem(text, docs, current_company):
+    """Why a claim line fails its citation checks, or None if it passes."""
+    numbers = [int(n) for group in CITATION_RE.findall(text) for n in group.split(",")]
+    if not numbers:
+        return "no citation"
+    if any(not 1 <= n <= len(docs) for n in numbers):
+        return "cites a non-existent excerpt"
+    if current_company:
+        wrong = [n for n in numbers if company_of(docs[n - 1].metadata.get("source")) != current_company]
+        if wrong:
+            return f"cites another company's excerpt {''.join(f'[{n}]' for n in wrong)}"
+    return None
+
+def check_claims(answer, docs):
+    """
+    Drop-and-keep: claim lines that fail their citation checks are removed, everything else is kept.
+    Returns (kept_lines, removed, total_claims) where removed = [(claim, reason), ...].
+    """
+    kept, removed = [], []
+    total_claims = 0
+    current_company = None
+    section_has_content = True   # becomes False at each company heading until a valid line follows
+
+    def close_section():
+        if not section_has_content:
+            kept.extend([SECTION_EMPTY, ""])
+
+    for line in answer.splitlines():
+        text = line.strip()
+        plain = text.strip("*#-• \t").strip()
+        if not plain:
+            kept.append(line)
+            continue
+        if is_heading(text, plain):
+            company = section_company(plain, docs)
+            if company and company != current_company:   # a new company section starts
+                close_section()
+                current_company = company
+                section_has_content = False
+            kept.append(line)
+            continue
+        if NO_INFO.lower() in plain.lower():
+            kept.append(line)
+            section_has_content = True
+            continue
+        total_claims += 1
+        reason = claim_problem(text, docs, current_company)
+        if reason:
+            removed.append((plain, reason))
+        else:
+            kept.append(line)
+            section_has_content = True
+    close_section()
+    return kept, removed, total_claims
+
 def main():
     print("Initializing the Local Production RAG Application...")
     
@@ -150,29 +244,43 @@ def main():
     
     # 4. Execute the query
     question = "What are the primary risk factors related to supply chain disruptions for Cisco and FedEx?"
-    print(f"\n🧠 Synthesizing answer for: '{question}'\n")
+    print(f"\n🧠 Question: '{question}'\n")
     print("-" * 50)
 
-    docs = retrieve(question)
-    
-    # Stream the output directly to the console like ChatGPT
-    answer_parts = []
-    for chunk in chain.stream({"context": format_docs(docs), "question": question}):
-        print(chunk, end="", flush=True)
-        answer_parts.append(chunk)
-    answer = "".join(answer_parts)
+    # Gate 1: evidence. Refuse without calling the LLM if no chunk is relevant enough.
+    docs = apply_evidence_gate(retrieve(question))
+    if not docs:
+        print(REFUSAL_NO_EVIDENCE)
+        print(f"   (no retrieved chunk scored >= {MIN_RELEVANCE})")
+        return
+
+    # Not streamed: the answer must pass the citation check before it is shown
+    print(f"   generating answer from {len(docs)} supporting chunk(s)...\n")
+    answer = chain.invoke({"context": format_docs(docs), "question": question})
+
+    # Gate 2: citations. Drop claims that fail their checks; refuse if more than half fail.
+    kept, removed, total_claims = check_claims(answer, docs)
+    if total_claims and len(removed) > total_claims * MAX_REMOVED_FRACTION:
+        print(REFUSAL_FAILED_CHECKS)
+        print(f"   ({len(removed)} of {total_claims} claims failed:)")
+        for claim, reason in removed:
+            print(f"   - {reason}: {claim[:80]}")
+        return
+
+    answer = "\n".join(kept).strip()
+    print(answer)
+
+    if removed:
+        print(f"\nNote: {len(removed)} of {total_claims} claim(s) removed because their citations failed checks:")
+        for claim, reason in removed:
+            print(f"   - {reason}: {claim[:80]}")
 
     # 5. Sources: the code (not the LLM) turns each cited number into file / company / pages
     print("\n" + "-" * 50)
     print("Sources:")
-    cited = extract_citations(answer)
-    for n in cited:
-        if 1 <= n <= len(docs):
-            print(f"  [{n}] {source_label(docs[n - 1])}")
-        else:
-            print(f"  [{n}] ⚠️ cited, but there is no excerpt with this number")
-    if not cited:
-        print("  (the answer contains no citations; treat it as unverified)")
+    for n in extract_citations(answer):
+        doc = docs[n - 1]
+        print(f"  [{n}] {source_label(doc)} | relevance {doc.metadata.get('relevance_score')}")
 
 if __name__ == "__main__":
     main()
