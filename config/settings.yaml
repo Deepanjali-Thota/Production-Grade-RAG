@@ -1,0 +1,19 @@
+# Tunable settings for the RAG app. Change values here, not in the code.
+
+retrieval:
+  final_k: 10                # chunks sent to the LLM (shared between the companies in the question)
+
+llm:
+  model: llama3.1
+  temperature: 0
+  num_ctx: 16384             # context window; 10 chunks x ~1000 tokens needs > 8k
+
+enforcement:
+  min_relevance: 0.10        # chunks the reranker scores below this are not used as evidence
+  max_removed_fraction: 0.5  # refuse if more than this share of claims fail their citation checks
+
+messages:
+  refusal_no_evidence: "I can't answer this: none of the documents contain passages relevant to the question."
+  refusal_failed_checks: "I can't give a reliable answer: most claims in the generated answer failed citation checks."
+  no_info: "No relevant information found in the provided excerpts"
+  section_empty: "No supported information remained for this company after citation checks."

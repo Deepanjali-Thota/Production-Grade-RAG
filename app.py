@@ -9,14 +9,16 @@ from langchain_core.output_parsers import StrOutputParser
 
 # Import your highly optimized two-stage retriever
 from src.retrieval.hybrid_search import build_reranked_retriever
+# Settings and the versioned prompt live in config/settings.yaml and config/prompts.yaml
+from src.config import SETTINGS, PROMPT_VERSION, PROMPT_TEMPLATE
 
-FINAL_K = 10
-MIN_RELEVANCE = 0.10   # chunks the reranker scores below this are not used as evidence
-REFUSAL_NO_EVIDENCE = "I can't answer this: none of the documents contain passages relevant to the question."
-REFUSAL_FAILED_CHECKS = "I can't give a reliable answer: most claims in the generated answer failed citation checks."
-NO_INFO = "No relevant information found in the provided excerpts"
-SECTION_EMPTY = "No supported information remained for this company after citation checks."
-MAX_REMOVED_FRACTION = 0.5   # refuse if more than half of the claims fail their citation checks
+FINAL_K = SETTINGS["retrieval"]["final_k"]
+MIN_RELEVANCE = SETTINGS["enforcement"]["min_relevance"]
+MAX_REMOVED_FRACTION = SETTINGS["enforcement"]["max_removed_fraction"]
+REFUSAL_NO_EVIDENCE = SETTINGS["messages"]["refusal_no_evidence"]
+REFUSAL_FAILED_CHECKS = SETTINGS["messages"]["refusal_failed_checks"]
+NO_INFO = SETTINGS["messages"]["no_info"]
+SECTION_EMPTY = SETTINGS["messages"]["section_empty"]
 
 # Company names extracted automatically from each document (src/ingestion/extract_companies.py)
 COMPANIES_FILE = "data/companies.json"
@@ -218,28 +220,14 @@ def main():
     # 1. Load the retrieval models once (they are reused for every company search)
     build_reranked_retriever(final_k=FINAL_K)
     
-    # 2. Initialize the local LLM via Ollama
-    print("\nConnecting to local Llama 3.1 engine...")
-    llm = ChatOllama(model="llama3.1", temperature=0, num_ctx=16384)
+    # 2. Initialize the local LLM via Ollama (settings from config/settings.yaml)
+    llm_cfg = SETTINGS["llm"]
+    print(f"\nConnecting to local {llm_cfg['model']} engine...")
+    llm = ChatOllama(model=llm_cfg["model"], temperature=llm_cfg["temperature"], num_ctx=llm_cfg["num_ctx"])
     
-    # 3. Create the strict system prompt
-    template = """You are a strict financial analyst. You will be provided with numbered excerpts from SEC 10-K filings.
-    Each excerpt starts with its number in square brackets, followed by the file name, the company it belongs to, and the page(s).
-    
-    Your task:
-    1. Answer the question using ONLY the provided excerpts. Every statement must come from an excerpt; never reuse wording from these instructions.
-    2. If the question asks about multiple companies, create a separate section for each company.
-    3. Under each company, use ONLY excerpts that belong to THAT company. Never attribute information from one company's excerpt to a different company. If no excerpt belongs to a company, say "No relevant information found in the provided excerpts."
-    4. Write in the third person using the company name, not "we" or "our".
-    5. End EVERY sentence or bullet with the number of the excerpt it came from, in square brackets, e.g. [3]. If it came from two excerpts, write [3][5]. Only use numbers that appear in the excerpts.
-    
-    Excerpts:
-    {context}
-
-    Question: {question}
-
-    Answer:"""
-    prompt = ChatPromptTemplate.from_template(template)
+    # 3. Load the active, versioned prompt from config/prompts.yaml
+    print(f"Using prompt version: {PROMPT_VERSION}")
+    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
     chain = prompt | llm | StrOutputParser()
     
     # 4. Execute the query
