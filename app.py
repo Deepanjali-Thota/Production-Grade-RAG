@@ -1,9 +1,9 @@
 import os
+import sys
 import re
 import json
 import unicodedata
 from collections import Counter
-from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -214,61 +214,95 @@ def check_claims(answer, docs):
     close_section()
     return kept, removed, total_claims
 
-def main():
-    print("Initializing the Local Production RAG Application...")
-    
-    # 1. Load the retrieval models once (they are reused for every company search)
-    build_reranked_retriever(final_k=FINAL_K)
-    
-    # 2. Initialize the local LLM via Ollama (settings from config/settings.yaml)
-    llm_cfg = SETTINGS["llm"]
-    print(f"\nConnecting to local {llm_cfg['model']} engine...")
-    llm = ChatOllama(model=llm_cfg["model"], temperature=llm_cfg["temperature"], num_ctx=llm_cfg["num_ctx"])
-    
-    # 3. Load the active, versioned prompt from config/prompts.yaml
-    print(f"Using prompt version: {PROMPT_VERSION}")
-    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-    chain = prompt | llm | StrOutputParser()
-    
-    # 4. Execute the query
-    question = "What are the primary risk factors related to supply chain disruptions for Cisco and FedEx?"
-    print(f"\n🧠 Question: '{question}'\n")
-    print("-" * 50)
+def build_llm():
+    """LLM chosen in config/settings.yaml: provider 'cohere' (hosted, fast) or 'ollama' (local)."""
+    cfg = SETTINGS["llm"]
+    provider = cfg.get("provider", "ollama").lower()
+    if provider == "cohere":
+        from langchain_cohere import ChatCohere   # reads COHERE_API_KEY from .env
+        return ChatCohere(model=cfg["cohere_model"], temperature=cfg["temperature"])
+    if provider == "ollama":
+        from langchain_ollama import ChatOllama
+        return ChatOllama(model=cfg["model"], temperature=cfg["temperature"], num_ctx=cfg["num_ctx"])
+    raise ValueError(f"Unknown llm.provider '{provider}' in config/settings.yaml. Use 'cohere' or 'ollama'.")
+
+_chain = None
+
+def get_chain():
+    """Prompt + LLM, built once and reused for every question."""
+    global _chain
+    if _chain is None:
+        prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+        _chain = prompt | build_llm() | StrOutputParser()
+    return _chain
+
+def answer_question(question):
+    """
+    Runs the whole pipeline for one question and returns a dict:
+      answer    - final text shown to the user (the refusal message if refused)
+      refused   - True if the system refused to answer
+      reason    - why it refused ("no_evidence" or "failed_checks"), else None
+      contexts  - text of the chunks given to the LLM (used by the evaluation)
+      sources   - [{"ref", "label", "relevance"}] for the excerpts the answer cites
+      removed   - [(claim, reason)] claims dropped by the citation checks
+    """
+    result = {"question": question, "answer": "", "refused": False, "reason": None,
+              "contexts": [], "sources": [], "removed": []}
 
     # Gate 1: evidence. Refuse without calling the LLM if no chunk is relevant enough.
     docs = apply_evidence_gate(retrieve(question))
     if not docs:
-        print(REFUSAL_NO_EVIDENCE)
-        print(f"   (no retrieved chunk scored >= {MIN_RELEVANCE})")
-        return
+        result.update(answer=REFUSAL_NO_EVIDENCE, refused=True, reason="no_evidence")
+        return result
+    result["contexts"] = [doc.page_content for doc in docs]
 
-    # Not streamed: the answer must pass the citation check before it is shown
-    print(f"   generating answer from {len(docs)} supporting chunk(s)...\n")
-    answer = chain.invoke({"context": format_docs(docs), "question": question})
+    # Not streamed: the answer must pass the citation checks before it is shown
+    raw_answer = get_chain().invoke({"context": format_docs(docs), "question": question})
 
     # Gate 2: citations. Drop claims that fail their checks; refuse if more than half fail.
-    kept, removed, total_claims = check_claims(answer, docs)
+    kept, removed, total_claims = check_claims(raw_answer, docs)
+    result["removed"] = removed
     if total_claims and len(removed) > total_claims * MAX_REMOVED_FRACTION:
-        print(REFUSAL_FAILED_CHECKS)
-        print(f"   ({len(removed)} of {total_claims} claims failed:)")
-        for claim, reason in removed:
-            print(f"   - {reason}: {claim[:80]}")
-        return
+        result.update(answer=REFUSAL_FAILED_CHECKS, refused=True, reason="failed_checks")
+        return result
+
+        # The model found nothing to say (only "No relevant information..." lines): that is a refusal too
+    if total_claims == len(removed):
+        result.update(answer=REFUSAL_NO_EVIDENCE, refused=True, reason="no_answer_in_excerpts")
+        return result
 
     answer = "\n".join(kept).strip()
-    print(answer)
+    result["answer"] = answer
+    # Sources: the code (not the LLM) turns each cited number into file / company / pages
+    result["sources"] = [
+        {"ref": n, "label": source_label(docs[n - 1]), "relevance": docs[n - 1].metadata.get("relevance_score")}
+        for n in extract_citations(answer) if 1 <= n <= len(docs)
+    ]
+    return result
 
-    if removed:
-        print(f"\nNote: {len(removed)} of {total_claims} claim(s) removed because their citations failed checks:")
-        for claim, reason in removed:
+def main():
+    # Usage: python app.py "your question"     (no argument -> the default question below)
+    question = " ".join(sys.argv[1:]).strip() or \
+        "What are the primary risk factors related to supply chain disruptions for Cisco and FedEx?"
+
+    llm_cfg = SETTINGS["llm"]
+    print(f"LLM: {llm_cfg.get('provider', 'ollama')} | prompt version: {PROMPT_VERSION}")
+    print(f"\n🧠 Question: '{question}'\n")
+    print("-" * 50)
+
+    result = answer_question(question)
+    print(result["answer"])
+
+    if result["removed"]:
+        print(f"\n{len(result['removed'])} claim(s) failed citation checks:")
+        for claim, reason in result["removed"]:
             print(f"   - {reason}: {claim[:80]}")
 
-    # 5. Sources: the code (not the LLM) turns each cited number into file / company / pages
-    print("\n" + "-" * 50)
-    print("Sources:")
-    for n in extract_citations(answer):
-        doc = docs[n - 1]
-        print(f"  [{n}] {source_label(doc)} | relevance {doc.metadata.get('relevance_score')}")
+    if not result["refused"]:
+        print("\n" + "-" * 50)
+        print("Sources:")
+        for s in result["sources"]:
+            print(f"  [{s['ref']}] {s['label']} | relevance {s['relevance']}")
 
 if __name__ == "__main__":
     main()

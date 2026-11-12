@@ -4,9 +4,11 @@ retrieval:
   final_k: 10                # chunks sent to the LLM (shared between the companies in the question)
 
 llm:
-  model: llama3.1
+  provider: cohere           # "cohere" (hosted, seconds per answer) or "ollama" (local, slow on CPU)
+  cohere_model: command-a-03-2025
   temperature: 0
-  num_ctx: 16384             # context window; 10 chunks x ~1000 tokens needs > 8k
+  model: llama3.1            # used when provider is ollama
+  num_ctx: 16384             # ollama context window; 10 chunks x ~1000 tokens needs > 8k
 
 enforcement:
   min_relevance: 0.10        # chunks the reranker scores below this are not used as evidence
