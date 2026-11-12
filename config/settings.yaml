@@ -19,3 +19,11 @@ messages:
   refusal_failed_checks: "I can't give a reliable answer: most claims in the generated answer failed citation checks."
   no_info: "No relevant information found in the provided excerpts"
   section_empty: "No supported information remained for this company after citation checks."
+
+
+evaluation:
+  pause_seconds: 7           # wait between questions, to stay under API calls-per-minute limits
+  judge:                     # LLM that RAGAS uses to judge faithfulness (any OpenAI-compatible API)
+    model: command-a-03-2025
+    base_url: https://api.cohere.ai/compatibility/v1
+    api_key_env: COHERE_API_KEY

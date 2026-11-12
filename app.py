@@ -81,9 +81,13 @@ def detect_companies(question):
 
 def question_for_company(question, key):
     """Rewrite the question so it names only ONE company (other names lower the reranker's scores)."""
-    q = question
-    for alias in COMPANY_ALIASES:   # mark every company mention, e.g. "Cisco", "FedEx's"
-        q = re.sub(rf"\b{re.escape(alias)}(?:'s|’s)?\b", "\x00", q, flags=re.IGNORECASE)
+    # Plain ASCII copy, so "Estée Lauder’s" matches the alias "estee lauder"
+    q = unicodedata.normalize("NFKD", question.replace("’", "'")).encode("ascii", "ignore").decode()
+    legal = "|".join(sorted((re.escape(w) for w in LEGAL_WORDS if w != "the"), key=len, reverse=True))
+    # A mention is: optional "The", the alias, optional legal words ("Corporation", ", Inc."), optional 's
+    tail = rf"(?:'s)?(?:[\s,]+(?:{legal})\b\.?)*(?:'s)?"
+    for alias in sorted(COMPANY_ALIASES, key=len, reverse=True):   # longest first: "micron technology" before "micron"
+        q = re.sub(rf"(?:\bthe\s+)?\b{re.escape(alias)}\b{tail}", "\x00", q, flags=re.IGNORECASE)
     # "Cisco, FedEx and P&G" -> one marker, then remove it
     q = re.sub(r"\x00(?:\s*(?:,|\band\b|\bor\b|&)\s*\x00)*", "\x00", q, flags=re.IGNORECASE)
     q = re.sub(r"\s+", " ", q.replace("\x00", "")).strip()
