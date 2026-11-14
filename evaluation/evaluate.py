@@ -51,6 +51,7 @@ def set_results_dir(path):
 set_results_dir(RESULTS_DIR)
 
 EVAL = SETTINGS["evaluation"]
+EVAL["pause_seconds"] = float(os.getenv("EVAL_PAUSE_SECONDS", EVAL["pause_seconds"]))
 CITATION_RE = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\]")
 
 
