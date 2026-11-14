@@ -14,3 +14,7 @@ langchain-cohere==0.6.0
 cohere==5.21.1
 streamlit==1.67.0
 pymupdf==2.1
+docling
+tiktoken
+langchain-text-splitters==1.1.3
+boto3==1.44.3
