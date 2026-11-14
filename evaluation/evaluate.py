@@ -14,6 +14,7 @@ Usage (from the project root):
     python evaluation/evaluate.py                   # everything
     python evaluation/evaluate.py --stage score     # re-score saved answers only
     python evaluation/evaluate.py --fresh           # ignore saved answers and start again
+    python evaluation/evaluate.py --ci --check      # CI subset; exit code 1 if below thresholds
 """
 import os
 import re
@@ -35,9 +36,19 @@ from src.config import SETTINGS, PROMPT_VERSION
 
 GOLDEN_FILE = "evaluation/golden_dataset.jsonl"
 RESULTS_DIR = "evaluation/results"
-ANSWERS_FILE = os.path.join(RESULTS_DIR, "answers.jsonl")
-SCORES_FILE = os.path.join(RESULTS_DIR, "scores.jsonl")
-SUMMARY_FILE = os.path.join(RESULTS_DIR, "summary.json")
+CI_RESULTS_DIR = "evaluation/results/ci"   # kept apart, so a CI run never overwrites the full run
+ANSWERS_FILE = SCORES_FILE = SUMMARY_FILE = None
+
+
+def set_results_dir(path):
+    global RESULTS_DIR, ANSWERS_FILE, SCORES_FILE, SUMMARY_FILE
+    RESULTS_DIR = path
+    ANSWERS_FILE = os.path.join(path, "answers.jsonl")
+    SCORES_FILE = os.path.join(path, "scores.jsonl")
+    SUMMARY_FILE = os.path.join(path, "summary.json")
+
+
+set_results_dir(RESULTS_DIR)
 
 EVAL = SETTINGS["evaluation"]
 CITATION_RE = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\]")
@@ -128,14 +139,14 @@ async def score_faithfulness(rows):
         await asyncio.sleep(EVAL["pause_seconds"])
 
 
-def score(answers):
+def score(answers, reuse=True):
     answerable = [dict(a) for a in answers if a["type"] != "unanswerable"]
     unanswerable = [dict(a) for a in answers if a["type"] == "unanswerable"]
 
     # Answerable questions: only real answers can be judged for faithfulness
     answered = [a for a in answerable if not a["refused"]]
     # Reuse scores from the last run when the answer has not changed
-    previous = {r["id"]: r for r in read_jsonl(SCORES_FILE) if r.get("faithfulness") is not None}
+    previous = {r["id"]: r for r in read_jsonl(SCORES_FILE) if r.get("faithfulness") is not None} if reuse else {}
     for a in answered:
         old = previous.get(a["id"])
         if old and old.get("answer") == a["answer"]:
@@ -174,17 +185,47 @@ def score(answers):
     return summary, answered, refused_answerable, unanswerable
 
 
+def check_thresholds(summary, expected_questions):
+    """Compare the summary with the thresholds in config/settings.yaml. Returns a list of failures."""
+    t = EVAL["ci"]["thresholds"]
+    failures = []
+    if summary["questions"] < expected_questions:
+        failures.append(f"only {summary['questions']} of {expected_questions} questions were answered "
+                        f"(the rest failed, e.g. API errors)")
+    if summary["faithfulness"] is None or summary["faithfulness"] < t["min_faithfulness"]:
+        failures.append(f"faithfulness {summary['faithfulness']} < {t['min_faithfulness']}")
+    if summary["answer_rate"] is None or summary["answer_rate"] < t["min_answer_rate"]:
+        failures.append(f"answer_rate {summary['answer_rate']} < {t['min_answer_rate']}")
+    if summary["refusal_accuracy"] is not None and summary["refusal_accuracy"] < t["min_refusal_accuracy"]:
+        failures.append(f"refusal_accuracy {summary['refusal_accuracy']} < {t['min_refusal_accuracy']}")
+    if summary["faithfulness_failed_to_score"] > t["max_unscored"]:
+        failures.append(f"{summary['faithfulness_failed_to_score']} answers could not be scored "
+                        f"(max {t['max_unscored']})")
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, help="only the first N golden questions")
     parser.add_argument("--stage", choices=["all", "answers", "score"], default="all")
-    parser.add_argument("--fresh", action="store_true", help="ignore saved answers and regenerate them")
+    parser.add_argument("--fresh", action="store_true", help="ignore saved answers and scores and redo both")
+    parser.add_argument("--ci", action="store_true", help="only the CI subset of questions (settings.yaml)")
+    parser.add_argument("--check", action="store_true", help="exit with code 1 if a threshold is not met")
     args = parser.parse_args()
 
     golden = read_jsonl(GOLDEN_FILE)
     if not golden:
         print(f"{GOLDEN_FILE} not found or empty. Run evaluation/build_golden.py first.")
         sys.exit(1)
+    if args.ci:
+        ci_ids = EVAL["ci"]["question_ids"]
+        missing = [i for i in ci_ids if i not in {g["id"] for g in golden}]
+        if missing:
+            print(f"CI question ids not in {GOLDEN_FILE}: {missing}")
+            sys.exit(1)
+        golden = [g for g in golden if g["id"] in set(ci_ids)]
+        set_results_dir(CI_RESULTS_DIR)
+        print(f"CI subset: {len(golden)} questions, results in {RESULTS_DIR}")
     if args.limit:
         golden = golden[: args.limit]
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -195,10 +236,13 @@ def main():
         wanted = {g["id"] for g in golden}
         answers = [a for a in read_jsonl(ANSWERS_FILE) if a["id"] in wanted]
         print(f"Loaded {len(answers)} saved answers.")
-    if args.stage == "answers" or not answers:
+    if args.stage == "answers":
         return
+    if not answers:
+        print("No answers to score.")
+        sys.exit(1 if args.check else 0)
 
-    summary, answered, refused_answerable, unanswerable = score(answers)
+    summary, answered, refused_answerable, unanswerable = score(answers, reuse=not args.fresh)
 
     print("\n" + "=" * 60)
     print("EVALUATION SUMMARY")
@@ -221,6 +265,16 @@ def main():
         for u in wrong:
             print(f"  {u['id']}: {u['question'][:70]}")
     print(f"\nDetails: {SCORES_FILE}   Summary: {SUMMARY_FILE}")
+
+    if args.check:
+        failures = check_thresholds(summary, len(golden))
+        print("\n" + "=" * 60)
+        if failures:
+            print("QUALITY GATE: FAILED")
+            for f in failures:
+                print(f"  - {f}")
+            sys.exit(1)
+        print("QUALITY GATE: PASSED")
 
 
 if __name__ == "__main__":

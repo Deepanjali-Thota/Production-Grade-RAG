@@ -27,3 +27,12 @@ evaluation:
     model: command-a-03-2025
     base_url: https://api.cohere.ai/compatibility/v1
     api_key_env: COHERE_API_KEY
+
+  ci:                        # subset run on every pull request (python evaluation/evaluate.py --ci --check)
+    question_ids: [q001, q003, q005, q008, q009, q011, q013, q015, q017, q020, q021, q024, q025, q028, q029,
+                   m001, m002, m003, u001, u002, u003]
+    thresholds:              # the build fails if any of these is not met
+      min_faithfulness: 0.90       # subset baseline: 0.964
+      min_answer_rate: 0.90        # subset baseline: 1.0 (18 of 18)
+      min_refusal_accuracy: 1.0    # subset baseline: 1.0 (3 of 3)
+      max_unscored: 0              # answers the judge failed to score
