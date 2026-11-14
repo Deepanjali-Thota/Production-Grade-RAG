@@ -1,0 +1,95 @@
+# Runs the RAG evaluation on every pull request and fails the build if quality drops
+# below the thresholds in config/settings.yaml (evaluation.ci.thresholds).
+name: RAG evaluation
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  workflow_dispatch:            # also lets you start it by hand from the Actions tab
+
+# A new push to the same PR cancels the run still going, so API calls are not wasted
+concurrency:
+  group: evaluate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+      RERANKER: cohere
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+      S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      # Two Pythons, as on your laptop: 3.14 runs the pipeline, 3.12 runs RAGAS
+      - name: Set up Python 3.12 (scoring)
+        id: py_eval
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Python 3.14 (pipeline)
+        id: py_app
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-eval.txt
+
+      - name: Install pipeline packages
+        # CPU-only PyTorch: the CI machine has no GPU and this is a much smaller download
+        run: |
+          ${{ steps.py_app.outputs.python-path }} -m pip install -r requirements.txt \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install scoring packages (separate environment)
+        run: |
+          ${{ steps.py_eval.outputs.python-path }} -m venv .venv-eval
+          .venv-eval/bin/python -m pip install -r requirements-eval.txt
+
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ hashFiles('src/retrieval/hybrid_search.py') }}
+
+      - name: Download the evaluation data from S3
+        run: |
+          aws s3 cp "s3://${S3_BUCKET_NAME}/ci/ci_data.zip" ci_data.zip
+          unzip -q ci_data.zip
+          ls data
+
+      - name: Generate answers for the CI questions
+        run: ${{ steps.py_app.outputs.python-path }} evaluation/evaluate.py --ci --stage answers
+
+      - name: Score answers and check thresholds
+        run: .venv-eval/bin/python evaluation/evaluate.py --ci --stage score --check
+
+      - name: Add the scores to the run summary
+        if: always()
+        run: |
+          if [ -f evaluation/results/ci/summary.json ]; then
+            echo '## RAG evaluation (CI subset)' >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat evaluation/results/ci/summary.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Keep the answers and scores
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-results
+          path: evaluation/results/ci/
+          if-no-files-found: ignore
