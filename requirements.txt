@@ -12,3 +12,5 @@ torch==2.15.0
 rank-bm25==0.2.2
 langchain-cohere==0.6.0
 cohere==5.21.1
+streamlit==1.67.0
+pymupdf==2.1
